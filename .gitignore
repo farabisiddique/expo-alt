@@ -1,0 +1,20 @@
+# local config - holds personal values (IPs, usernames); never commit
+.env
+.env.*
+!.env.example
+
+# secrets / keys - none should ever exist in this project, but belt-and-braces
+*.pem
+*.key
+id_ed25519*
+*.keystore
+*.jks
+
+# editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# logs
+*.log

@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# expo-alt :: cook - build an Expo Android APK locally on this VPS.
+#
+# Usage:
+#   cook <repo-name> [profile] [git-ref] [--no-check]
+#
+#     repo-name   required; repo URL is git@github.com:$GITHUB_USER/<repo-name>.git
+#     profile     eas.json build profile (default: preview)
+#     git-ref     branch, tag or commit SHA (default: main)
+#     --no-check  skip the `tsc --noEmit` quality gate
+#
+# Reads config from ~/.config/expo-alt/env (EXPO_TOKEN, GITHUB_USER,
+# BUILD_URL_BASE, optional retention settings). Streams all output to stdout
+# AND to ~/kitchen/logs/<repo>-<UTCtimestamp>.log. On success the last line
+# of both is "DOWNLOAD: <url>".
+#
+# Install:  sudo install -m 755 cook /usr/local/bin/cook
+#
+set -euo pipefail
+
+usage() { sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+die() { printf 'cook: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ arguments
+
+NO_CHECK=0
+POS=()
+for arg in "$@"; do
+  case "$arg" in
+    --no-check) NO_CHECK=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         die "unknown flag: $arg (see cook --help)" ;;
+    *)          POS+=("$arg") ;;
+  esac
+done
+REPO="${POS[0]:-}"
+PROFILE="${POS[1]:-preview}"
+REF="${POS[2]:-main}"
+[ -n "$REPO" ] || { usage; exit 1; }
+case "$REPO" in
+  */*|*..*) die "invalid repo name: $REPO" ;;
+esac
+
+# ------------------------------------------------------------------ environment
+# `ssh vps "cook ..."` runs a non-interactive shell, so /etc/profile.d is NOT
+# sourced automatically - do it ourselves, with sane fallbacks.
+
+if [ -f /etc/profile.d/expo-alt.sh ]; then
+  # shellcheck disable=SC1091
+  . /etc/profile.d/expo-alt.sh
+fi
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+if [ -z "${JAVA_HOME:-}" ] && command -v javac >/dev/null 2>&1; then
+  JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+  export JAVA_HOME
+fi
+
+ENV_FILE="$HOME/.config/expo-alt/env"
+[ -f "$ENV_FILE" ] || die "config file missing: $ENV_FILE (run setup-kitchen.sh)"
+# Export everything defined in the env file (EXPO_TOKEN must reach eas-cli).
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+[ -n "${GITHUB_USER:-}" ]    || die "GITHUB_USER is not set in $ENV_FILE"
+[ -n "${BUILD_URL_BASE:-}" ] || die "BUILD_URL_BASE is not set in $ENV_FILE"
+if [ -z "${EXPO_TOKEN:-}" ]; then
+  die "EXPO_TOKEN is not set in $ENV_FILE - create one at expo.dev -> Account settings -> Access tokens"
+fi
+
+RETENTION_DAYS="${RETENTION_DAYS:-14}"
+MAX_BUILDS="${MAX_BUILDS:-20}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-60}"
+BUILDS_DIR="/var/www/builds"
+
+# ------------------------------------------------------------------ locking
+# One cook per repo at a time. fd 9 is opened in APPEND mode first so a failed
+# lock attempt does not truncate the holder info written by the running build.
+
+LOCK_DIR="$HOME/kitchen/locks"
+mkdir -p "$LOCK_DIR"
+LOCKFILE="$LOCK_DIR/$REPO.lock"
+exec 9>>"$LOCKFILE"
+if ! flock -n 9; then
+  printf 'cook: another build of "%s" is already running:\n' "$REPO" >&2
+  sed 's/^/  /' "$LOCKFILE" >&2 || true
+  printf 'cook: refusing to start. (The lock is released automatically when that build exits.)\n' >&2
+  exit 1
+fi
+printf 'pid=%s user=%s host=%s started=%sZ\n' \
+  "$$" "$(id -un)" "$(hostname)" "$(date -u +%Y-%m-%dT%H:%M:%S)" > "$LOCKFILE"
+
+# ------------------------------------------------------------------ logging
+
+LOG_DIR="$HOME/kitchen/logs"
+mkdir -p "$LOG_DIR"
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+LOG="$LOG_DIR/$REPO-$STAMP.log"
+# Everything from here on goes to the terminal AND the log file.
+exec > >(tee -- "$LOG") 2>&1
+
+START_EPOCH="$(date +%s)"
+elapsed() {
+  local s=$(( $(date +%s) - START_EPOCH ))
+  printf '%dm %02ds' $((s / 60)) $((s % 60))
+}
+
+on_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "${TMP_APK:-}" 2>/dev/null || true
+    printf '\n==========================================================\n'
+    printf '  BUILD FAILED (exit %s) after %s\n' "$status" "$(elapsed)"
+    printf '  full log : %s\n' "$LOG"
+    printf '==========================================================\n'
+  fi
+}
+trap on_exit EXIT
+
+# ------------------------------------------------------------------ fetch source
+
+REPO_DIR="$HOME/kitchen/repos/$REPO"
+REPO_URL="git@github.com:$GITHUB_USER/$REPO.git"
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+  echo "==> Cloning $REPO_URL"
+  git clone --quiet "$REPO_URL" "$REPO_DIR"
+fi
+cd "$REPO_DIR"
+git remote set-url origin "$REPO_URL"
+
+echo "==> Fetching origin"
+git fetch --quiet --tags --prune origin
+
+if git rev-parse --verify -q "refs/remotes/origin/$REF" >/dev/null; then
+  TARGET="origin/$REF"
+elif git rev-parse --verify -q "$REF^{commit}" >/dev/null; then
+  TARGET="$REF"
+else
+  die "ref '$REF' not found in $REPO (neither a remote branch nor a commit/tag)"
+fi
+
+# The kitchen copy is disposable: force-checkout the target and wipe anything
+# that is not tracked (node_modules is re-created by the install step anyway).
+git checkout --quiet --force --detach "$TARGET"
+git clean -ffdxq
+
+SHA="$(git rev-parse --short HEAD)"
+COMMIT_MSG="$(git log -1 --pretty=%s)"
+
+printf '\n==========================================================\n'
+printf '  expo-alt :: cook\n'
+printf '  repo    : %s\n' "$REPO"
+printf '  ref     : %s (%s)\n' "$REF" "$SHA"
+printf '  commit  : %s\n' "$COMMIT_MSG"
+printf '  profile : %s\n' "$PROFILE"
+printf '  started : %s UTC\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
+printf '  log     : %s\n' "$LOG"
+printf '==========================================================\n\n'
+
+# ------------------------------------------------------------------ install deps
+
+if [ -f yarn.lock ]; then
+  PM="yarn"
+elif [ -f pnpm-lock.yaml ]; then
+  PM="pnpm"
+else
+  PM="npm"
+fi
+echo "==> Installing dependencies ($PM, frozen lockfile)"
+case "$PM" in
+  yarn)
+    command -v yarn >/dev/null 2>&1 || corepack enable >/dev/null 2>&1 || true
+    yarn install --frozen-lockfile
+    ;;
+  pnpm)
+    command -v pnpm >/dev/null 2>&1 || corepack enable >/dev/null 2>&1 || true
+    pnpm install --frozen-lockfile
+    ;;
+  npm)
+    npm ci --no-audit --no-fund
+    ;;
+esac
+
+# ------------------------------------------------------------------ quality gate
+
+if [ -f tsconfig.json ] && [ "$NO_CHECK" -eq 0 ]; then
+  echo "==> Type check (npx tsc --noEmit) - skip with --no-check"
+  npx tsc --noEmit
+elif [ "$NO_CHECK" -eq 1 ]; then
+  echo "==> Type check skipped (--no-check)"
+fi
+
+# ------------------------------------------------------------------ app metadata
+
+APP_NAME="$REPO"
+APP_VERSION="0.0.0"
+if [ -f app.json ]; then
+  APP_NAME="$(jq -r '.expo.slug // .expo.name // empty' app.json || true)"
+  APP_VERSION="$(jq -r '.expo.version // empty' app.json || true)"
+  [ -n "$APP_NAME" ]    || APP_NAME="$REPO"
+  [ -n "$APP_VERSION" ] || APP_VERSION="0.0.0"
+else
+  echo "==> NOTE: no app.json (app.config.js/ts only?) - using repo name for the APK filename"
+fi
+# Keep the filename shell/URL-safe.
+APP_NAME="$(printf '%s' "$APP_NAME" | tr -c 'A-Za-z0-9._-' '-')"
+APP_VERSION="$(printf '%s' "$APP_VERSION" | tr -c 'A-Za-z0-9._-' '-')"
+
+# ------------------------------------------------------------------ build
+
+TMP_APK="$(mktemp -u "/tmp/${APP_NAME}-XXXXXXXX").apk"
+
+echo "==> Building: eas build --platform android --profile $PROFILE --local"
+echo "    (EXPO_TOKEN is set; output: $TMP_APK)"
+NODE_OPTIONS="--max_old_space_size=4096" \
+  eas build --platform android --profile "$PROFILE" --local --non-interactive \
+  --output="$TMP_APK"
+
+[ -s "$TMP_APK" ] || die "eas reported success but no APK was produced at $TMP_APK"
+
+# ------------------------------------------------------------------ publish
+
+BUILD_ID="$(openssl rand -hex 4)"
+DEST_DIR="$BUILDS_DIR/$BUILD_ID"
+APK_FILE="${APP_NAME}-${APP_VERSION}-$(date -u +%Y%m%d-%H%M).apk"
+
+mkdir -p "$DEST_DIR"
+mv "$TMP_APK" "$DEST_DIR/$APK_FILE"
+chmod 755 "$DEST_DIR"
+chmod 644 "$DEST_DIR/$APK_FILE"
+
+APK_SIZE="$(du -h "$DEST_DIR/$APK_FILE" | cut -f1)"
+URL="${BUILD_URL_BASE%/}/builds/$BUILD_ID/$APK_FILE"
+
+# ------------------------------------------------------------------ retention
+# Done BEFORE the footer so "DOWNLOAD: ..." stays the last line of the log.
+
+echo "==> Retention: pruning old builds and logs"
+find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" \
+  -exec rm -rf {} + 2>/dev/null || true
+# Keep only the $MAX_BUILDS newest build directories.
+mapfile -t OLD_DIRS < <(
+  find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | awk -v keep="$MAX_BUILDS" 'NR > keep { sub(/^[^ ]+ /, ""); print }'
+)
+for d in "${OLD_DIRS[@]}"; do
+  rm -rf "$d"
+done
+find "$LOG_DIR" -name '*.log' -type f -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+
+# ------------------------------------------------------------------ footer
+
+printf '\n==========================================================\n'
+printf '  BUILD OK   %s %s  (profile: %s, %s)\n' "$APP_NAME" "$APP_VERSION" "$PROFILE" "$SHA"
+printf '  duration : %s\n' "$(elapsed)"
+printf '  apk size : %s\n' "$APK_SIZE"
+printf '==========================================================\n'
+printf 'DOWNLOAD: %s\n' "$URL"
