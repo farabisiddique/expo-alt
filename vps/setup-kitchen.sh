@@ -10,24 +10,36 @@
 #
 #     bash setup-kitchen.sh
 #
+# Self-contained: every directory this system creates (SDK, caches, work
+# copies, logs, builds, temp) lives INSIDE the expo-alt directory this script
+# belongs to (e.g. /var/www/expo-alt). The only things outside it: system
+# packages (git/node/java/nginx), the nginx config in /etc/nginx, the env
+# lines in /etc/profile.d + ~/.bashrc, the SSH key in ~/.ssh, the swap file,
+# and a one-line /usr/local/bin/cook symlink pointing back in here.
+#
 # What it does:
 #   1. Installs git, curl, unzip, jq, Node.js 20, OpenJDK 17, nginx
 #   2. Installs the Android SDK (cmdline-tools, platform-tools, android-35,
-#      build-tools 35.0.0, NDK 27.1.12297006) into ~/android-sdk
+#      build-tools 35.0.0, NDK 27.1.12297006) into <expo-alt>/sdk/android
 #   3. Persists ANDROID_HOME / JAVA_HOME / PATH in ~/.bashrc and
 #      /etc/profile.d/expo-alt.sh
 #   4. Installs eas-cli globally
 #   5. Creates a 4G swap file if RAM < 8GB and no swap exists
-#   6. Creates ~/kitchen/{repos,logs,locks} and /var/www/builds
-#   7. Configures nginx to serve /var/www/builds at /builds/ (no autoindex)
-#   8. Creates ~/.config/expo-alt/env (chmod 600) and prompts for EXPO_TOKEN,
+#   6. Creates <expo-alt>/{kitchen,builds,cache,tmp} directory structure
+#   7. Configures nginx to serve <expo-alt>/builds at /builds/ (no autoindex)
+#   8. Ensures <expo-alt>/.env exists (chmod 600) and prompts for EXPO_TOKEN,
 #      GITHUB_USER, BUILD_URL_BASE when run interactively
-#   9. Generates an ed25519 GitHub deploy key and prints setup instructions
-#  10. Prints a self-check summary
+#   9. Symlinks /usr/local/bin/cook -> <expo-alt>/vps/cook
+#  10. Generates an ed25519 GitHub deploy key and prints setup instructions
+#  11. Prints a self-check summary
 #
 set -euo pipefail
 
 # ------------------------------------------------------------------ constants
+
+# ROOT = the expo-alt directory this script lives in (parent of vps/).
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 
 NODE_MAJOR=20
 # The "latest" command-line-tools zip is versioned. If this URL ever 404s,
@@ -36,11 +48,10 @@ NODE_MAJOR=20
 CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
 SDK_PACKAGES=("platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.1.12297006")
 
-ANDROID_HOME="$HOME/android-sdk"
-CONF_DIR="$HOME/.config/expo-alt"
-ENV_FILE="$CONF_DIR/env"
+ANDROID_HOME="$ROOT/sdk/android"
+ENV_FILE="$ROOT/.env"
 DEPLOY_KEY="$HOME/.ssh/expo_alt_deploy"
-BUILDS_DIR="/var/www/builds"
+BUILDS_DIR="$ROOT/builds"
 SWAP_FILE="/swapfile"
 PROFILE_D="/etc/profile.d/expo-alt.sh"
 NGINX_SNIPPET="/etc/nginx/snippets/expo-alt-builds.conf"
@@ -159,6 +170,7 @@ env_block() {
 export ANDROID_HOME="$ANDROID_HOME"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export JAVA_HOME="$JAVA_HOME"
+export GRADLE_USER_HOME="$ROOT/cache/gradle"
 export PATH="\$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools"
 EOF
 }
@@ -213,12 +225,16 @@ fi
 
 # ------------------------------------------------------------------ directories
 
-log "Creating directories"
-mkdir -p "$HOME/kitchen/repos" "$HOME/kitchen/logs" "$HOME/kitchen/locks"
-as_root mkdir -p "$BUILDS_DIR"
+log "Creating directory structure inside $ROOT"
+mkdir -p \
+  "$ROOT/kitchen/repos" "$ROOT/kitchen/logs" "$ROOT/kitchen/locks" \
+  "$ROOT/builds" \
+  "$ROOT/cache/gradle" "$ROOT/cache/npm" "$ROOT/cache/yarn" \
+  "$ROOT/tmp"
+# nginx (www-data) must be able to traverse into builds/ and read the APKs.
+as_root chmod 755 "$ROOT" "$ROOT/builds"
 as_root chown "$(id -un):www-data" "$BUILDS_DIR"
-as_root chmod 755 "$BUILDS_DIR"
-ok "~/kitchen/{repos,logs,locks} and $BUILDS_DIR ready"
+ok "kitchen/, builds/, cache/, tmp/ ready under $ROOT"
 
 # ------------------------------------------------------------------ nginx
 
@@ -226,11 +242,12 @@ log "Configuring nginx"
 
 # The reusable location block. It is written as a snippet so it can either be
 # used by our own server block (below) or `include`d into an existing one.
-as_root tee "$NGINX_SNIPPET" >/dev/null <<'EOF'
-# expo-alt: serve built APKs from /var/www/builds at /builds/
+# Only $BUILDS_DIR is exposed - never $ROOT itself (which holds .env).
+as_root tee "$NGINX_SNIPPET" >/dev/null <<EOF
+# expo-alt: serve built APKs from $BUILDS_DIR at /builds/
 # autoindex stays OFF: download URLs contain a random id and must stay unguessable.
 location /builds/ {
-    alias /var/www/builds/;
+    alias $BUILDS_DIR/;
     autoindex off;
     default_type application/octet-stream;
     types { application/vnd.android.package-archive apk; }
@@ -309,28 +326,21 @@ ok "nginx reloaded"
 # ------------------------------------------------------------------ config file / secrets
 
 log "Configuring $ENV_FILE"
-mkdir -p "$CONF_DIR"
 if [ ! -f "$ENV_FILE" ]; then
-  cat > "$ENV_FILE" <<'EOF'
+  if [ -f "$ROOT/.env.example" ]; then
+    cp "$ROOT/.env.example" "$ENV_FILE"
+    ok "created from .env.example"
+  else
+    cat > "$ENV_FILE" <<'EOF'
 # expo-alt configuration - sourced by `cook`. Keep this file chmod 600.
-# ---------------------------------------------------------------- required
-# Expo access token: expo.dev -> Account settings -> Access tokens
-EXPO_TOKEN=""
-# GitHub account/org that owns your app repos (repo URL convention:
-# git@github.com:$GITHUB_USER/<repo-name>.git)
 GITHUB_USER=""
-# Public base URL of this VPS, no trailing slash - e.g. http://203.0.113.7
-# or https://builds.example.com
 BUILD_URL_BASE=""
-# ---------------------------------------------------------------- optional
-# Delete build dirs older than this many days (default 14)
 #RETENTION_DAYS=14
-# Keep at most this many build dirs (default 20)
 #MAX_BUILDS=20
-# Delete logs older than this many days (default 60)
 #LOG_RETENTION_DAYS=60
 EOF
-  ok "template written"
+    ok "template written"
+  fi
 else
   ok "already exists - keeping current values"
 fi
@@ -345,23 +355,6 @@ set_kv() {
     printf '%s="%s"\n' "$key" "$val" >> "$ENV_FILE"
   fi
 }
-
-# Optional prefill: if a .env sits at this repo's root (it is gitignored, so
-# it only exists if you scp'd yours here), copy its non-secret values into
-# the server config for anything not already set.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PC_ENV="$REPO_ROOT/.env"
-if [ -f "$PC_ENV" ]; then
-  for k in GITHUB_USER BUILD_URL_BASE; do
-    if [ -z "$(get_kv "$k")" ]; then
-      v="$(grep -E "^${k}=" "$PC_ENV" | head -1 | cut -d= -f2- | tr -d '"' || true)"
-      if [ -n "$v" ]; then
-        set_kv "$k" "${v%/}"
-        ok "$k prefilled from $PC_ENV"
-      fi
-    fi
-  done
-fi
 
 if [ -t 0 ]; then
   if [ -z "$(get_kv EXPO_TOKEN)" ]; then
@@ -385,6 +378,15 @@ else
   warn "GITHUB_USER and BUILD_URL_BASE before the first build."
 fi
 chmod 600 "$ENV_FILE"
+
+# ------------------------------------------------------------------ install cook
+
+log "Installing cook"
+chmod +x "$ROOT/vps/cook"
+# A symlink (not a copy) so `git pull` updates cook with no reinstall step,
+# and so cook can locate $ROOT from its own real path.
+as_root ln -sfn "$ROOT/vps/cook" /usr/local/bin/cook
+ok "/usr/local/bin/cook -> $ROOT/vps/cook"
 
 # ------------------------------------------------------------------ deploy key
 
@@ -457,14 +459,12 @@ $(cat "${DEPLOY_KEY}.pub")
 2) Make sure EXPO_TOKEN, GITHUB_USER and BUILD_URL_BASE are set in:
      $ENV_FILE
 
-3) Install the build script:
-     sudo install -m 755 cook /usr/local/bin/cook
+3) Test SSH to GitHub from this VPS:
+     ssh -T git@github.com     (expect: "Hi <user>! You've successfully authenticated")
 
-4) Test SSH to GitHub from this VPS:
-     ssh -T git@github.com     (expect: "Hi <repo>! You've successfully authenticated")
-
-5) First build:
+4) First build:
      cook <repo-name>
 
+(cook is already installed: /usr/local/bin/cook -> $ROOT/vps/cook)
 Re-running this script at any time is safe.
 EOF

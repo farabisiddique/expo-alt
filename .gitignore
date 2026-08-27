@@ -3,6 +3,13 @@
 .env.*
 !.env.example
 
+# runtime dirs the VPS creates INSIDE this repo folder (self-contained layout)
+/kitchen/
+/builds/
+/sdk/
+/cache/
+/tmp/
+
 # secrets / keys - none should ever exist in this project, but belt-and-braces
 *.pem
 *.key

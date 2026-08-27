@@ -14,18 +14,30 @@
 #     git-ref     branch, tag or commit SHA (default: main)
 #     --no-check  skip the `tsc --noEmit` quality gate
 #
-# Reads config from ~/.config/expo-alt/env (EXPO_TOKEN, GITHUB_USER,
-# BUILD_URL_BASE, optional retention settings). Streams all output to stdout
-# AND to ~/kitchen/logs/<repo>-<UTCtimestamp>.log. On success the last line
+# Fully self-contained: every directory this script creates (work copies,
+# logs, locks, builds, caches, temp) lives inside the expo-alt directory the
+# script belongs to (e.g. /var/www/expo-alt). Config comes from the .env at
+# that directory's root. Streams all output to stdout AND to
+# kitchen/logs/<owner>--<repo>-<UTCtimestamp>.log. On success the last line
 # of both is "DOWNLOAD: <url>".
 #
-# Install:  sudo install -m 755 cook /usr/local/bin/cook
+# Install (done by setup-kitchen.sh): a SYMLINK, so `git pull` updates cook
+# with no reinstall step and the script can locate its own directory:
+#     ln -sfn /var/www/expo-alt/vps/cook /usr/local/bin/cook
 #
 set -euo pipefail
 
 usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
 die() { printf 'cook: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ self-location
+# ROOT = the expo-alt directory. readlink -f resolves the /usr/local/bin
+# symlink to this real file, so ROOT is correct wherever the repo lives.
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+[ -f "$ROOT/vps/cook" ] || die "cannot locate the expo-alt dir from $SELF (install cook as a SYMLINK, not a copy)"
 
 # ------------------------------------------------------------------ arguments
 
@@ -50,22 +62,31 @@ case "$REPO" in
 esac
 
 # ------------------------------------------------------------------ environment
-# `ssh vps "cook ..."` runs a non-interactive shell, so /etc/profile.d is NOT
-# sourced automatically - do it ourselves, with sane fallbacks.
+# All toolchain paths and caches are contained inside $ROOT. Nothing outside
+# it is written to (system packages, nginx config and ~/.ssh excepted).
 
-if [ -f /etc/profile.d/expo-alt.sh ]; then
-  # shellcheck disable=SC1091
-  . /etc/profile.d/expo-alt.sh
-fi
-export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
-export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+export ANDROID_HOME="${ANDROID_HOME:-$ROOT/sdk/android}"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$ROOT/cache/gradle}"
+export npm_config_cache="${npm_config_cache:-$ROOT/cache/npm}"
+export YARN_CACHE_FOLDER="${YARN_CACHE_FOLDER:-$ROOT/cache/yarn}"
+export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools"
 if [ -z "${JAVA_HOME:-}" ] && command -v javac >/dev/null 2>&1; then
   JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
   export JAVA_HOME
 fi
 
-ENV_FILE="$HOME/.config/expo-alt/env"
-[ -f "$ENV_FILE" ] || die "config file missing: $ENV_FILE (run setup-kitchen.sh)"
+# Even eas-cli's temporary build workdir stays inside $ROOT/tmp.
+TMP_DIR="$ROOT/tmp"
+mkdir -p "$TMP_DIR"
+EAS_WORKDIR="$TMP_DIR/eas-work-$$"
+export EAS_LOCAL_BUILD_WORKINGDIR="$EAS_WORKDIR"
+
+ENV_FILE="$ROOT/.env"
+if [ ! -f "$ENV_FILE" ] && [ -f "$HOME/.config/expo-alt/env" ]; then
+  ENV_FILE="$HOME/.config/expo-alt/env"   # legacy location fallback
+fi
+[ -f "$ENV_FILE" ] || die "config file missing: $ROOT/.env (run setup-kitchen.sh)"
 # Export everything defined in the env file (EXPO_TOKEN must reach eas-cli).
 set -a
 # shellcheck disable=SC1090
@@ -94,13 +115,13 @@ REPO_SLUG="${REPO_OWNER}--${REPO_NAME}"
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
 MAX_BUILDS="${MAX_BUILDS:-20}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-60}"
-BUILDS_DIR="/var/www/builds"
+BUILDS_DIR="$ROOT/builds"
 
 # ------------------------------------------------------------------ locking
 # One cook per repo at a time. fd 9 is opened in APPEND mode first so a failed
 # lock attempt does not truncate the holder info written by the running build.
 
-LOCK_DIR="$HOME/kitchen/locks"
+LOCK_DIR="$ROOT/kitchen/locks"
 mkdir -p "$LOCK_DIR"
 LOCKFILE="$LOCK_DIR/$REPO_SLUG.lock"
 exec 9>>"$LOCKFILE"
@@ -115,7 +136,7 @@ printf 'pid=%s user=%s host=%s started=%sZ\n' \
 
 # ------------------------------------------------------------------ logging
 
-LOG_DIR="$HOME/kitchen/logs"
+LOG_DIR="$ROOT/kitchen/logs"
 mkdir -p "$LOG_DIR"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 LOG="$LOG_DIR/$REPO_SLUG-$STAMP.log"
@@ -130,6 +151,7 @@ elapsed() {
 
 on_exit() {
   local status=$?
+  if [ -n "${EAS_WORKDIR:-}" ]; then rm -rf "$EAS_WORKDIR" 2>/dev/null || true; fi
   if [ "$status" -ne 0 ]; then
     rm -f "${TMP_APK:-}" 2>/dev/null || true
     printf '\n==========================================================\n'
@@ -142,7 +164,7 @@ trap on_exit EXIT
 
 # ------------------------------------------------------------------ fetch source
 
-REPO_DIR="$HOME/kitchen/repos/$REPO_SLUG"
+REPO_DIR="$ROOT/kitchen/repos/$REPO_SLUG"
 REPO_URL="git@github.com:$REPO_OWNER/$REPO_NAME.git"
 
 if [ ! -d "$REPO_DIR/.git" ]; then
@@ -232,11 +254,15 @@ APP_VERSION="$(printf '%s' "$APP_VERSION" | tr -c 'A-Za-z0-9._-' '-')"
 
 # ------------------------------------------------------------------ build
 
-TMP_APK="$(mktemp -u "/tmp/${APP_NAME}-XXXXXXXX").apk"
+TMP_APK="$(mktemp -u "$TMP_DIR/${APP_NAME}-XXXXXXXX").apk"
 
 echo "==> Building: eas build --platform android --profile $PROFILE --local"
 echo "    (EXPO_TOKEN is set; output: $TMP_APK)"
+# nice/ionice: run the whole build tree (node, gradle, javac) at low CPU and
+# disk priority so live apps on this VPS always win contention. Costs the
+# build a little speed only when the box is otherwise busy.
 NODE_OPTIONS="--max_old_space_size=4096" \
+  nice -n 10 ionice -c2 -n7 \
   eas build --platform android --profile "$PROFILE" --local --non-interactive \
   --output="$TMP_APK"
 
