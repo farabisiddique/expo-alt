@@ -346,22 +346,39 @@ set_kv() {
   fi
 }
 
+# Optional prefill: if a .env sits at this repo's root (it is gitignored, so
+# it only exists if you scp'd yours here), copy its non-secret values into
+# the server config for anything not already set.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PC_ENV="$REPO_ROOT/.env"
+if [ -f "$PC_ENV" ]; then
+  for k in GITHUB_USER BUILD_URL_BASE; do
+    if [ -z "$(get_kv "$k")" ]; then
+      v="$(grep -E "^${k}=" "$PC_ENV" | head -1 | cut -d= -f2- | tr -d '"' || true)"
+      if [ -n "$v" ]; then
+        set_kv "$k" "${v%/}"
+        ok "$k prefilled from $PC_ENV"
+      fi
+    fi
+  done
+fi
+
 if [ -t 0 ]; then
   if [ -z "$(get_kv EXPO_TOKEN)" ]; then
     printf '\n  EXPO_TOKEN: create one at expo.dev -> Account settings -> Access tokens\n'
     # -s: never echo the secret to the terminal (and it never hits any log)
     read -r -s -p "  Paste EXPO_TOKEN (or press Enter to set it later): " tok
     printf '\n'
-    [ -n "$tok" ] && set_kv EXPO_TOKEN "$tok"
+    if [ -n "$tok" ]; then set_kv EXPO_TOKEN "$tok"; fi
     unset tok
   fi
   if [ -z "$(get_kv GITHUB_USER)" ]; then
     read -r -p "  GitHub username/org owning your app repos (Enter to skip): " gh
-    [ -n "$gh" ] && set_kv GITHUB_USER "$gh"
+    if [ -n "$gh" ]; then set_kv GITHUB_USER "$gh"; fi
   fi
   if [ -z "$(get_kv BUILD_URL_BASE)" ]; then
     read -r -p "  Public base URL of this VPS, e.g. http://<vps-ip> (Enter to skip): " base
-    [ -n "$base" ] && set_kv BUILD_URL_BASE "${base%/}"
+    if [ -n "$base" ]; then set_kv BUILD_URL_BASE "${base%/}"; fi
   fi
 else
   warn "Non-interactive run: edit $ENV_FILE and fill in EXPO_TOKEN,"

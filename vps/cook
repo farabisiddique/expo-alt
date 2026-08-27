@@ -3,9 +3,13 @@
 # expo-alt :: cook - build an Expo Android APK locally on this VPS.
 #
 # Usage:
-#   cook <repo-name> [profile] [git-ref] [--no-check]
+#   cook <repo> [profile] [git-ref] [--no-check]
 #
-#     repo-name   required; repo URL is git@github.com:$GITHUB_USER/<repo-name>.git
+#     repo        "name"       -> git@github.com:$GITHUB_USER/name.git
+#                 "owner/name" -> git@github.com:owner/name.git
+#                 (owner/name form is for repos you collaborate on; your VPS
+#                 SSH key must have GitHub access to them, and your Expo
+#                 account must have access to the project's credentials)
 #     profile     eas.json build profile (default: preview)
 #     git-ref     branch, tag or commit SHA (default: main)
 #     --no-check  skip the `tsc --noEmit` quality gate
@@ -19,7 +23,7 @@
 #
 set -euo pipefail
 
-usage() { sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
 die() { printf 'cook: ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -39,8 +43,10 @@ REPO="${POS[0]:-}"
 PROFILE="${POS[1]:-preview}"
 REF="${POS[2]:-main}"
 [ -n "$REPO" ] || { usage; exit 1; }
+# Accept "name" (owned by $GITHUB_USER) or "owner/name" (e.g. a friend's repo
+# you collaborate on). Anything else is rejected.
 case "$REPO" in
-  */*|*..*) die "invalid repo name: $REPO" ;;
+  *..*|/*|*/|*/*/*|.*) die "invalid repo: $REPO (use 'name' or 'owner/name')" ;;
 esac
 
 # ------------------------------------------------------------------ environment
@@ -72,6 +78,19 @@ if [ -z "${EXPO_TOKEN:-}" ]; then
   die "EXPO_TOKEN is not set in $ENV_FILE - create one at expo.dev -> Account settings -> Access tokens"
 fi
 
+# Resolve "name" vs "owner/name" (the latter for repos you collaborate on).
+if [ "${REPO#*/}" != "$REPO" ]; then
+  REPO_OWNER="${REPO%%/*}"
+  REPO_NAME="${REPO#*/}"
+else
+  REPO_OWNER="$GITHUB_USER"
+  REPO_NAME="$REPO"
+fi
+{ [ -n "$REPO_OWNER" ] && [ -n "$REPO_NAME" ]; } || die "invalid repo: $REPO"
+# Filesystem-safe id used for the lock, log and working-copy directory names,
+# so owner/name repos can't collide with your own repo of the same name.
+REPO_SLUG="${REPO_OWNER}--${REPO_NAME}"
+
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
 MAX_BUILDS="${MAX_BUILDS:-20}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-60}"
@@ -83,7 +102,7 @@ BUILDS_DIR="/var/www/builds"
 
 LOCK_DIR="$HOME/kitchen/locks"
 mkdir -p "$LOCK_DIR"
-LOCKFILE="$LOCK_DIR/$REPO.lock"
+LOCKFILE="$LOCK_DIR/$REPO_SLUG.lock"
 exec 9>>"$LOCKFILE"
 if ! flock -n 9; then
   printf 'cook: another build of "%s" is already running:\n' "$REPO" >&2
@@ -99,7 +118,7 @@ printf 'pid=%s user=%s host=%s started=%sZ\n' \
 LOG_DIR="$HOME/kitchen/logs"
 mkdir -p "$LOG_DIR"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
-LOG="$LOG_DIR/$REPO-$STAMP.log"
+LOG="$LOG_DIR/$REPO_SLUG-$STAMP.log"
 # Everything from here on goes to the terminal AND the log file.
 exec > >(tee -- "$LOG") 2>&1
 
@@ -123,8 +142,8 @@ trap on_exit EXIT
 
 # ------------------------------------------------------------------ fetch source
 
-REPO_DIR="$HOME/kitchen/repos/$REPO"
-REPO_URL="git@github.com:$GITHUB_USER/$REPO.git"
+REPO_DIR="$HOME/kitchen/repos/$REPO_SLUG"
+REPO_URL="git@github.com:$REPO_OWNER/$REPO_NAME.git"
 
 if [ ! -d "$REPO_DIR/.git" ]; then
   echo "==> Cloning $REPO_URL"
@@ -154,7 +173,7 @@ COMMIT_MSG="$(git log -1 --pretty=%s)"
 
 printf '\n==========================================================\n'
 printf '  expo-alt :: cook\n'
-printf '  repo    : %s\n' "$REPO"
+printf '  repo    : %s/%s\n' "$REPO_OWNER" "$REPO_NAME"
 printf '  ref     : %s (%s)\n' "$REF" "$SHA"
 printf '  commit  : %s\n' "$COMMIT_MSG"
 printf '  profile : %s\n' "$PROFILE"
@@ -197,12 +216,12 @@ fi
 
 # ------------------------------------------------------------------ app metadata
 
-APP_NAME="$REPO"
+APP_NAME="$REPO_NAME"
 APP_VERSION="0.0.0"
 if [ -f app.json ]; then
   APP_NAME="$(jq -r '.expo.slug // .expo.name // empty' app.json || true)"
   APP_VERSION="$(jq -r '.expo.version // empty' app.json || true)"
-  [ -n "$APP_NAME" ]    || APP_NAME="$REPO"
+  [ -n "$APP_NAME" ]    || APP_NAME="$REPO_NAME"
   [ -n "$APP_VERSION" ] || APP_VERSION="0.0.0"
 else
   echo "==> NOTE: no app.json (app.config.js/ts only?) - using repo name for the APK filename"

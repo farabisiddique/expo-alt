@@ -3,27 +3,29 @@
 #
 # ============================== INSTALL ======================================
 #
-# 1) Create an SSH host alias on your PC so `ssh kitchen` works. Edit (or
-#    create) the file  C:\Users\<you>\.ssh\config  and add:
+# 1) Fill in the .env file at the root of this project (copy .env.example to
+#    .env if it doesn't exist). toast reads VPS_SSH_USER + VPS_IP_OR_DOMAIN
+#    from it, so with a default-path SSH key (~/.ssh/id_ed25519) no ssh config
+#    is needed at all.
+#
+#    Optional: if you prefer an ~/.ssh/config Host alias (custom key/port),
+#    create one and put its name in VPS_SSH_ALIAS in .env:
 #
 #        Host kitchen
 #            HostName <VPS_IP_OR_DOMAIN>
 #            User <VPS_SSH_USER>
 #            IdentityFile ~/.ssh/id_ed25519
 #
-#    (Generate a key with `ssh-keygen -t ed25519` if you don't have one, and
-#    put the .pub contents into ~/.ssh/authorized_keys on the VPS.)
-#    Test it:  ssh kitchen "echo ok"
+#    Either way, key-based login must work first. If you don't have a key:
+#        ssh-keygen -t ed25519
+#    then append the contents of ~/.ssh/id_ed25519.pub to
+#    ~/.ssh/authorized_keys on the VPS. Test:  ssh <user>@<vps> "echo ok"
 #
-# 2) Add these functions to your PowerShell profile. Either:
-#
-#    a) Dot-source this file from your profile. Open the profile:
-#           notepad $PROFILE
-#       (If it doesn't exist: New-Item -ItemType File -Force $PROFILE)
-#       Add this line, adjusting the path to wherever you keep this file:
-#           . "D:\PROJECTS\EXPO Projects\expo-alt\local\toast.ps1"
-#
-#    b) Or paste the functions below directly into $PROFILE.
+# 2) Add these functions to your PowerShell profile. Open the profile:
+#        notepad $PROFILE
+#    (If it doesn't exist: New-Item -ItemType File -Force $PROFILE)
+#    Add this line, adjusting the path to wherever you cloned this repo:
+#        . "D:\PROJECTS\EXPO Projects\expo-alt\local\toast.ps1"
 #
 # 3) Reload:  . $PROFILE     (or open a new terminal)
 #
@@ -33,6 +35,7 @@
 #       toast myapp                    # profile "preview", ref "main"
 #       toast myapp production         # profile "production"
 #       toast myapp preview develop    # build the "develop" branch
+#       toast friend/theirapp          # a repo you collaborate on (owner/name)
 #       toast myapp -NoCheck           # skip the tsc gate
 #
 #   toast-push <repo-name> [profile] [ref] [-NoCheck]
@@ -42,8 +45,38 @@
 # $LASTEXITCODE, so `toast myapp; if ($LASTEXITCODE -eq 0) { ... }` works.
 # =============================================================================
 
-# Name of the Host entry in your ~/.ssh/config (step 1 above).
-$script:ToastVpsAlias = "kitchen"
+# Repo root = parent of the local/ directory this script lives in.
+$script:ToastRepoRoot = Split-Path -Parent $PSScriptRoot
+
+function Get-ToastEnvValue {
+    param([Parameter(Mandatory = $true)][string]$Key)
+    $envFile = Join-Path $script:ToastRepoRoot ".env"
+    if (-not (Test-Path $envFile)) {
+        return ""
+    }
+    # Matches:  KEY=value  or  KEY="value"  (leading whitespace tolerated)
+    $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*"?([^"]*)"?\s*$'
+    foreach ($line in (Get-Content $envFile)) {
+        if ($line -match $pattern) {
+            return $Matches[1].Trim()
+        }
+    }
+    return ""
+}
+
+function Get-ToastSshTarget {
+    # Read on every call so .env edits apply without reloading the profile.
+    $alias = Get-ToastEnvValue "VPS_SSH_ALIAS"
+    if ($alias -ne "") {
+        return $alias
+    }
+    $sshUser = Get-ToastEnvValue "VPS_SSH_USER"
+    $vpsHost = Get-ToastEnvValue "VPS_IP_OR_DOMAIN"
+    if ($sshUser -ne "" -and $vpsHost -ne "") {
+        return "$sshUser@$vpsHost"
+    }
+    return ""
+}
 
 function toast {
     [CmdletBinding()]
@@ -62,6 +95,13 @@ function toast {
         [switch]$NoCheck
     )
 
+    $target = Get-ToastSshTarget
+    if ($target -eq "") {
+        Write-Host "toast: no VPS configured. Fill in VPS_SSH_USER and VPS_IP_OR_DOMAIN" -ForegroundColor Red
+        Write-Host ("toast: (or VPS_SSH_ALIAS) in: {0}" -f (Join-Path $script:ToastRepoRoot ".env")) -ForegroundColor Red
+        return
+    }
+
     $remoteCmd = "cook $Repo $BuildProfile"
     if ($Ref -ne "") {
         $remoteCmd = "$remoteCmd $Ref"
@@ -70,12 +110,12 @@ function toast {
         $remoteCmd = "$remoteCmd --no-check"
     }
 
-    Write-Host ("toast: ssh {0} `"{1}`"" -f $script:ToastVpsAlias, $remoteCmd) -ForegroundColor Cyan
+    Write-Host ("toast: ssh {0} `"{1}`"" -f $target, $remoteCmd) -ForegroundColor Cyan
 
     # -t allocates a pseudo-tty so the build output streams live line by line.
     # ssh exits with the remote command's exit code; it lands in $LASTEXITCODE
     # and is left untouched so callers/scripts can check it.
-    ssh -t $script:ToastVpsAlias $remoteCmd
+    ssh -t $target $remoteCmd
 
     if ($LASTEXITCODE -eq 0) {
         Write-Host "toast: build finished OK" -ForegroundColor Green

@@ -72,6 +72,18 @@ caches between builds, which is a key advantage over cold cloud builders.
 
 ## Setup, in order
 
+### 0. Fill in your `.env`
+
+```powershell
+copy .env.example .env      # then open .env and fill in the values
+```
+
+`.env` is gitignored — your values stay local. `toast` reads the VPS address
+and user from it; if you also scp it to the repo root on the VPS,
+`setup-kitchen.sh` prefills `GITHUB_USER` and `BUILD_URL_BASE` from it.
+(`EXPO_TOKEN` deliberately does **not** go in `.env` — you enter it on the
+VPS when the setup script prompts.)
+
 ### 1. Copy the files to the VPS and provision it
 
 From this project directory on your PC:
@@ -128,15 +140,13 @@ Smoke-test directly on the VPS: `cook myapp` (or `cook myapp production develop`
 
 ### 5. Install `toast` on your PC
 
-1. Make sure key-based SSH to the VPS works, then add a host alias in
-   `C:\Users\<you>\.ssh\config`:
-
-   ```
-   Host kitchen
-       HostName <VPS_IP_OR_DOMAIN>
-       User <VPS_SSH_USER>
-       IdentityFile ~/.ssh/id_ed25519
-   ```
+1. Make sure key-based SSH to the VPS works
+   (`ssh <VPS_SSH_USER>@<VPS_IP_OR_DOMAIN> "echo ok"` without a password
+   prompt — if not: `ssh-keygen -t ed25519` and append the `.pub` contents to
+   `~/.ssh/authorized_keys` on the VPS). `toast` builds the ssh target from
+   your `.env` (`VPS_SSH_USER@VPS_IP_OR_DOMAIN`), so no ssh config is needed.
+   If you prefer an `~/.ssh/config` `Host` alias (custom key/port), create
+   one and put its name in `VPS_SSH_ALIAS` in `.env`.
 
 2. Add [local/toast.ps1](local/toast.ps1) to your PowerShell profile:
 
@@ -154,6 +164,7 @@ Smoke-test directly on the VPS: `cook myapp` (or `cook myapp production develop`
 toast myapp                  # profile "preview", ref "main"
 toast myapp production       # different profile
 toast myapp preview develop  # different branch
+toast friend/theirapp        # a repo you collaborate on (owner/name form)
 toast-push myapp             # git push (from the app repo dir), then build
 ```
 
