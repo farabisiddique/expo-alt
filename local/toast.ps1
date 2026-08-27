@@ -31,15 +31,19 @@
 #
 # ============================== USAGE ========================================
 #
-#   toast <repo-name> [profile] [ref] [-NoCheck]
-#       toast myapp                    # profile "preview", ref "main"
+#   toast [repo-name] [profile] [ref] [-NoCheck]
+#       toast                          # inside your app's folder: repo is
+#                                      # auto-detected from `git remote origin`
+#       toast myapp                    # explicit repo, profile "preview"
 #       toast myapp production         # profile "production"
 #       toast myapp preview develop    # build the "develop" branch
 #       toast friend/theirapp          # a repo you collaborate on (owner/name)
+#       toast -BuildProfile production # auto-detected repo, chosen profile
 #       toast myapp -NoCheck           # skip the tsc gate
 #
-#   toast-push <repo-name> [profile] [ref] [-NoCheck]
-#       `git push` from the current directory first, then toast.
+#   toast-push [repo-name] [profile] [ref] [-NoCheck]
+#       `git push` from the current directory first, then toast
+#       (repo auto-detected the same way when omitted).
 #
 # Output streams live (ssh -t). The remote exit code is passed through in
 # $LASTEXITCODE, so `toast myapp; if ($LASTEXITCODE -eq 0) { ... }` works.
@@ -64,6 +68,21 @@ function Get-ToastEnvValue {
     return ""
 }
 
+function Get-ToastRepoFromGit {
+    # Returns "owner/name" parsed from the current directory's `origin`
+    # remote, or "" if this isn't a git repo / origin isn't on github.com.
+    $url = ""
+    try { $url = (git remote get-url origin 2>$null | Select-Object -First 1) } catch {}
+    if (-not $url) { return "" }
+    $url = "$url".Trim()
+    # Handles: git@github.com:owner/name.git, https://github.com/owner/name(.git),
+    #          ssh://git@github.com/owner/name.git
+    if ($url -match 'github\.com[:/]([^/]+)/([^/]+?)(\.git)?/?$') {
+        return ($Matches[1] + "/" + $Matches[2])
+    }
+    return ""
+}
+
 function Get-ToastSshTarget {
     # Read on every call so .env edits apply without reloading the profile.
     $alias = Get-ToastEnvValue "VPS_SSH_ALIAS"
@@ -81,8 +100,10 @@ function Get-ToastSshTarget {
 function toast {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true, Position = 0)]
-        [string]$Repo,
+        # Optional: when omitted, detected from the current directory's git
+        # remote (run `toast` inside your app's folder).
+        [Parameter(Position = 0)]
+        [string]$Repo = "",
 
         # NOTE: named BuildProfile because $Profile is a PowerShell automatic
         # variable (path to your profile script) and must not be shadowed.
@@ -94,6 +115,17 @@ function toast {
 
         [switch]$NoCheck
     )
+
+    if ($Repo -eq "") {
+        $Repo = Get-ToastRepoFromGit
+        if ($Repo -eq "") {
+            Write-Host "toast: no repo given and none detected here." -ForegroundColor Red
+            Write-Host "toast: run this inside your app's git folder (with a github.com 'origin' remote)," -ForegroundColor Red
+            Write-Host "toast: or name the repo explicitly:  toast <repo-name>" -ForegroundColor Red
+            return
+        }
+        Write-Host ("toast: repo detected from this folder's git remote: {0}" -f $Repo) -ForegroundColor Cyan
+    }
 
     $target = Get-ToastSshTarget
     if ($target -eq "") {
@@ -128,8 +160,8 @@ function toast {
 function toast-push {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true, Position = 0)]
-        [string]$Repo,
+        [Parameter(Position = 0)]
+        [string]$Repo = "",
 
         [Parameter(Position = 1)]
         [string]$BuildProfile = "preview",

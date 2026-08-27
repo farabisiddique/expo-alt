@@ -45,8 +45,10 @@ signing keystore and the remote `versionCode`, then builds on your hardware.
 
 - **VPS**: 2+ vCPU, **8 GB RAM** — or 4 GB + swap (the setup script creates a
   4 GB swap file automatically; builds work but are slower). **~35 GB free
-  disk**: Android SDK + NDK ≈ 12 GB, Gradle caches grow to ~10 GB, plus
-  node_modules per repo and the built APKs.
+  disk** as a comfortable ceiling: Android SDK + NDK ≈ 5 GB (the NDK is most
+  of it; no emulator/system images are installed), Gradle caches grow to
+  ~5–10 GB over time, plus 1–2 GB of node_modules per repo and the built
+  APKs.
 - **App repo**: Expo SDK app (this setup targets SDK 57 / RN 0.86) with an
   `eas.json` containing the profile you build, configured to produce an APK:
 
@@ -165,11 +167,13 @@ BUILD_URL_BASE="http://<VPS_IP_OR_DOMAIN>"   # no trailing slash, no path
 ### 6. First build
 
 ```powershell
-toast myapp                  # profile "preview", ref "main"
+toast                        # inside your app's folder: repo auto-detected
+                             # from its git remote; profile "preview", ref "main"
+toast-push                   # git push this folder, then build it
+toast myapp                  # explicit repo name (any folder)
 toast myapp production       # different profile
 toast myapp preview develop  # different branch
 toast friend/theirapp        # a repo you collaborate on (owner/name form)
-toast-push myapp             # git push (from the app repo dir), then build
 ```
 
 On success the last line printed — and the last line of the saved log on the
