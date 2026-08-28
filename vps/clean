@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+#
+# expo-alt :: clean - retention and cleanup for builds, logs, repos, caches.
+#
+# Usage:
+#   kitchen-clean [--dry-run] [--after-build]
+#
+#     (no flags)     full clean: APKs, logs, tmp, idle repos' node_modules,
+#                    stale repo copies, oversized gradle cache
+#     --after-build  quick pass only (APKs, logs, tmp) - what cook runs
+#                    after every successful build
+#     --dry-run      print what would be deleted, delete nothing
+#
+# Policies - override any of these in <expo-alt>/.env:
+#   RETENTION_DAYS=14               delete build dirs older than this
+#   MAX_BUILDS=20                   keep at most this many build dirs
+#   LOG_RETENTION_DAYS=60           delete logs older than this
+#   TMP_RETENTION_HOURS=24          delete tmp/ entries older than this
+#   NODE_MODULES_RETENTION_DAYS=7   drop node_modules of repos idle this long
+#   REPO_RETENTION_DAYS=30          delete whole working copies idle this long
+#   GRADLE_CACHE_MAX_GB=10          wipe gradle cache if it grows past this
+#
+# Safety: a repo whose build is running (cook holds its lock) is never
+# touched, and the gradle cache is only wiped when no build runs at all.
+# Everything deleted here is regenerable: repos re-clone, node_modules
+# re-install, caches re-warm - the only cost is a slower next build.
+#
+set -euo pipefail
+
+usage() { sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'; }
+die()   { printf 'clean: ERROR: %s\n' "$*" >&2; exit 1; }
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+[ -f "$ROOT/vps/clean" ] || die "cannot locate the expo-alt dir from $SELF"
+
+DRY=0
+AFTER_BUILD=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)     DRY=1 ;;
+    --after-build) AFTER_BUILD=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             die "unknown flag: $arg (see kitchen-clean --help)" ;;
+  esac
+done
+
+# Config (only the retention values are used; secrets are neither needed nor printed).
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.env"
+  set +a
+fi
+RETENTION_DAYS="${RETENTION_DAYS:-14}"
+MAX_BUILDS="${MAX_BUILDS:-20}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-60}"
+TMP_RETENTION_HOURS="${TMP_RETENTION_HOURS:-24}"
+NODE_MODULES_RETENTION_DAYS="${NODE_MODULES_RETENTION_DAYS:-7}"
+REPO_RETENTION_DAYS="${REPO_RETENTION_DAYS:-30}"
+GRADLE_CACHE_MAX_GB="${GRADLE_CACHE_MAX_GB:-10}"
+
+BUILDS_DIR="$ROOT/builds"
+LOG_DIR="$ROOT/kitchen/logs"
+LOCK_DIR="$ROOT/kitchen/locks"
+REPOS_DIR="$ROOT/kitchen/repos"
+TMP_DIR="$ROOT/tmp"
+GRADLE_DIR="$ROOT/cache/gradle"
+
+shopt -s nullglob
+NOW="$(date +%s)"
+
+# del <path>: report (with size) and delete unless --dry-run.
+del() {
+  local t="$1" sz
+  [ -e "$t" ] || return 0
+  sz="$(du -sh "$t" 2>/dev/null | cut -f1 || echo '?')"
+  if [ "$DRY" -eq 1 ]; then
+    printf '  would delete: %s (%s)\n' "$t" "$sz"
+  else
+    rm -rf "$t"
+    printf '  deleted: %s (%s)\n' "$t" "$sz"
+  fi
+}
+
+# age_days <path>: whole days since last modification.
+age_days() { echo $(( (NOW - $(stat -c %Y "$1")) / 86400 )); }
+
+# ------------------------------------------------------------------ 1. APKs
+
+printf '== builds/ (older than %sd, keep %s newest)\n' "$RETENTION_DAYS" "$MAX_BUILDS"
+while IFS= read -r d; do
+  del "$d"
+done < <(find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" 2>/dev/null)
+while IFS= read -r d; do
+  del "$d"
+done < <(
+  find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | awk -v keep="$MAX_BUILDS" 'NR > keep { sub(/^[^ ]+ /, ""); print }'
+)
+
+# ------------------------------------------------------------------ 2. logs
+
+printf '== logs/ (older than %sd)\n' "$LOG_RETENTION_DAYS"
+while IFS= read -r f; do
+  del "$f"
+done < <(find "$LOG_DIR" -name '*.log' -type f -mtime +"$LOG_RETENTION_DAYS" 2>/dev/null)
+
+# ------------------------------------------------------------------ 3. tmp
+
+printf '== tmp/ (older than %sh)\n' "$TMP_RETENTION_HOURS"
+while IFS= read -r t; do
+  del "$t"
+done < <(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -mmin +"$((TMP_RETENTION_HOURS * 60))" 2>/dev/null)
+
+if [ "$AFTER_BUILD" -eq 1 ]; then
+  exit 0
+fi
+
+# ------------------------------------------------------------------ 4. repos
+# Idle time = time since cook last touched the working copy. A repo whose
+# build is running holds its flock - we take the same lock non-blocking and
+# skip the repo if we can't get it.
+
+printf '== kitchen/repos/ (node_modules idle %sd+, whole copy idle %sd+)\n' \
+  "$NODE_MODULES_RETENTION_DAYS" "$REPO_RETENTION_DAYS"
+ANY_BUSY=0
+for d in "$REPOS_DIR"/*/; do
+  d="${d%/}"
+  slug="$(basename "$d")"
+  lock="$LOCK_DIR/$slug.lock"
+  if ! (
+    exec 9>>"$lock"
+    if ! flock -n 9; then
+      printf '  skip %s: build running\n' "$slug"
+      exit 3
+    fi
+    age="$(age_days "$d")"
+    if [ "$age" -ge "$REPO_RETENTION_DAYS" ]; then
+      del "$d"
+      del "$lock"
+    elif [ "$age" -ge "$NODE_MODULES_RETENTION_DAYS" ] && [ -d "$d/node_modules" ]; then
+      del "$d/node_modules"
+    fi
+  ); then
+    ANY_BUSY=1
+  fi
+done
+
+# ------------------------------------------------------------------ 5. gradle cache
+
+printf '== cache/gradle (cap %sGB)\n' "$GRADLE_CACHE_MAX_GB"
+if [ -d "$GRADLE_DIR" ]; then
+  size_kb="$(du -sk "$GRADLE_DIR" 2>/dev/null | cut -f1 || echo 0)"
+  max_kb="$((GRADLE_CACHE_MAX_GB * 1024 * 1024))"
+  if [ "$size_kb" -gt "$max_kb" ]; then
+    # Only wipe when nothing builds right now (a running gradle would corrupt).
+    for lock in "$LOCK_DIR"/*.lock; do
+      if ! ( exec 9>>"$lock"; flock -n 9 ); then ANY_BUSY=1; fi
+    done
+    if [ "$ANY_BUSY" -eq 1 ]; then
+      printf '  over cap (%sMB) but a build is running - skipping this time\n' "$((size_kb / 1024))"
+    else
+      del "$GRADLE_DIR"
+      [ "$DRY" -eq 1 ] || mkdir -p "$GRADLE_DIR"
+    fi
+  else
+    printf '  ok: %sMB used\n' "$((size_kb / 1024))"
+  fi
+fi
+
+if [ "$DRY" -eq 1 ]; then
+  echo 'clean: done (dry run - nothing was deleted)'
+else
+  echo 'clean: done'
+fi

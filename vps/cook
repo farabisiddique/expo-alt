@@ -112,9 +112,6 @@ fi
 # so owner/name repos can't collide with your own repo of the same name.
 REPO_SLUG="${REPO_OWNER}--${REPO_NAME}"
 
-RETENTION_DAYS="${RETENTION_DAYS:-14}"
-MAX_BUILDS="${MAX_BUILDS:-20}"
-LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-60}"
 BUILDS_DIR="$ROOT/builds"
 
 # ------------------------------------------------------------------ locking
@@ -279,24 +276,22 @@ mv "$TMP_APK" "$DEST_DIR/$APK_FILE"
 chmod 755 "$DEST_DIR"
 chmod 644 "$DEST_DIR/$APK_FILE"
 
+# Record what this build id maps to, so `burn` (self-destruct after first
+# download) knows what to delete. Stored OUTSIDE the web-served builds/ dir.
+mkdir -p "$ROOT/kitchen/burn"
+printf 'slug=%s\nlog=%s\n' "$REPO_SLUG" "$LOG" > "$ROOT/kitchen/burn/$BUILD_ID.meta"
+
 APK_SIZE="$(du -h "$DEST_DIR/$APK_FILE" | cut -f1)"
 URL="${BUILD_URL_BASE%/}/builds/$BUILD_ID/$APK_FILE"
 
 # ------------------------------------------------------------------ retention
 # Done BEFORE the footer so "DOWNLOAD: ..." stays the last line of the log.
 
-echo "==> Retention: pruning old builds and logs"
-find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" \
-  -exec rm -rf {} + 2>/dev/null || true
-# Keep only the $MAX_BUILDS newest build directories.
-mapfile -t OLD_DIRS < <(
-  find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
-    | sort -rn | awk -v keep="$MAX_BUILDS" 'NR > keep { sub(/^[^ ]+ /, ""); print }'
-)
-for d in "${OLD_DIRS[@]}"; do
-  rm -rf "$d"
-done
-find "$LOG_DIR" -name '*.log' -type f -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+# Quick pass only (APKs, logs, tmp); the weekly cron runs the full clean
+# (idle repos, node_modules, gradle cache cap) via the same script.
+echo "==> Retention: pruning old builds, logs and tmp"
+"$ROOT/vps/clean" --after-build \
+  || echo "    (cleanup warnings - run 'kitchen-clean --dry-run' to inspect)"
 
 # ------------------------------------------------------------------ footer
 
@@ -304,5 +299,9 @@ printf '\n==========================================================\n'
 printf '  BUILD OK   %s %s  (profile: %s, %s)\n' "$APP_NAME" "$APP_VERSION" "$PROFILE" "$SHA"
 printf '  duration : %s\n' "$(elapsed)"
 printf '  apk size : %s\n' "$APK_SIZE"
+if [ "${BURN_AFTER_DOWNLOAD:-1}" != "0" ]; then
+  printf '  burn     : link self-destructs %s min after its first download\n' \
+    "${DOWNLOAD_TTL_MINUTES:-30}"
+fi
 printf '==========================================================\n'
 printf 'DOWNLOAD: %s\n' "$URL"

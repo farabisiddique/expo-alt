@@ -201,6 +201,47 @@ Open that URL on the phone to install the APK.
   `/etc/ssh/sshd_config`), and consider fail2ban/ufw (allow 22, 80, 443).
 - Never commit `~/.config/expo-alt/env`, the deploy key, or logs to any repo.
 
+## Cleaning strategy
+
+Two tiers, one script ([vps/clean](vps/clean), installed as `kitchen-clean`):
+
+- **After every build** (`cook` runs it): prune APK dirs (older than 14 days
+  or beyond the 20 newest), logs older than 60 days, `tmp/` entries older
+  than 24 h.
+- **Weekly** (cron, Sunday 04:30): additionally delete `node_modules` of
+  repos not built for 7 days, whole working copies idle for 30 days (they
+  re-clone automatically on the next build), and wipe the Gradle cache if it
+  exceeds 10 GB.
+
+All limits are configurable in `.env`. Safety: a repo whose build is
+currently running is never touched (it holds its `flock`), and the Gradle
+cache is only wiped when no build runs at all. Everything deleted is
+regenerable — the only cost is a slower next build.
+
+```bash
+kitchen-clean --dry-run     # show what a full clean would delete
+kitchen-clean               # full clean now
+```
+
+## Burn after download
+
+Every build **self-destructs 30 minutes after its link is first used**.
+A cron job ([vps/burn](vps/burn), installed as `kitchen-burn`, every minute)
+scans the nginx access log for the first successful download of each
+`/builds/<id>/` link, records that timestamp, and once it is
+`DOWNLOAD_TTL_MINUTES` (default 30) old deletes *everything about that
+build*: the served APK directory, the cloned repo working copy, and that
+build's log file. The next build of the same repo simply re-clones.
+
+- The link works normally during the 30-minute window (re-downloads
+  included); after the burn it 404s — rebuild to get a fresh link.
+- A build that is *never* downloaded is untouched by burn; normal retention
+  (14 days / 20 newest) removes it eventually.
+- Disable with `BURN_AFTER_DOWNLOAD=0` in the VPS `.env`; tune the window
+  with `DOWNLOAD_TTL_MINUTES`.
+- If a build of the same repo is running at burn time, the working-copy
+  deletion is postponed a minute (lock-safe), never skipped.
+
 ## What runs where (retention)
 
 Everything lives under `/var/www/expo-alt/` on the VPS:
@@ -238,4 +279,6 @@ Deleting `/var/www/expo-alt` removes the entire system's data.
 |---|---|---|
 | [vps/setup-kitchen.sh](vps/setup-kitchen.sh) | One-time idempotent VPS provisioning | run in place from the expo-alt dir on the VPS |
 | [vps/cook](vps/cook) | The build script | stays in place; setup symlinks `/usr/local/bin/cook` to it |
+| [vps/clean](vps/clean) | Retention/cleanup (see Cleaning strategy) | symlinked as `kitchen-clean`; weekly cron `/etc/cron.d/expo-alt-clean` |
+| [vps/burn](vps/burn) | Self-destruct after download (see Burn after download) | symlinked as `kitchen-burn`; per-minute cron `/etc/cron.d/expo-alt-burn` |
 | [local/toast.ps1](local/toast.ps1) | `toast` / `toast-push` PowerShell wrappers | dot-sourced from `$PROFILE` on the PC |

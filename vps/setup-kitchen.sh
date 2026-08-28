@@ -379,14 +379,40 @@ else
 fi
 chmod 600 "$ENV_FILE"
 
-# ------------------------------------------------------------------ install cook
+# ------------------------------------------------------------------ install cook + helpers
 
-log "Installing cook"
-chmod +x "$ROOT/vps/cook"
-# A symlink (not a copy) so `git pull` updates cook with no reinstall step,
-# and so cook can locate $ROOT from its own real path.
+log "Installing cook, kitchen-clean and kitchen-burn"
+chmod +x "$ROOT/vps/cook" "$ROOT/vps/clean" "$ROOT/vps/burn"
+# Symlinks (not copies) so `git pull` updates them with no reinstall step,
+# and so the scripts can locate $ROOT from their own real paths.
 as_root ln -sfn "$ROOT/vps/cook" /usr/local/bin/cook
+as_root ln -sfn "$ROOT/vps/clean" /usr/local/bin/kitchen-clean
+as_root ln -sfn "$ROOT/vps/burn" /usr/local/bin/kitchen-burn
 ok "/usr/local/bin/cook -> $ROOT/vps/cook"
+ok "/usr/local/bin/kitchen-clean -> $ROOT/vps/clean"
+ok "/usr/local/bin/kitchen-burn -> $ROOT/vps/burn"
+
+# Weekly full clean (Sunday 04:30): prunes idle repos' node_modules, stale
+# working copies and an oversized gradle cache - things the quick after-build
+# pass leaves alone. See `kitchen-clean --help` for the policies.
+CLEAN_CRON="/etc/cron.d/expo-alt-clean"
+as_root tee "$CLEAN_CRON" >/dev/null <<EOF
+# expo-alt: weekly full cleanup (managed by setup-kitchen.sh)
+30 4 * * 0 $(id -un) /usr/local/bin/kitchen-clean >> $ROOT/kitchen/logs/clean.log 2>&1
+EOF
+as_root chmod 644 "$CLEAN_CRON"
+ok "weekly clean scheduled: $CLEAN_CRON (Sun 04:30)"
+
+# Burn-after-download: every minute, stamp first downloads seen in the nginx
+# access log; DOWNLOAD_TTL_MINUTES after a build's first download, delete its
+# APK dir, repo working copy and log. Quiet unless it acts.
+BURN_CRON="/etc/cron.d/expo-alt-burn"
+as_root tee "$BURN_CRON" >/dev/null <<EOF
+# expo-alt: self-destruct downloaded builds (managed by setup-kitchen.sh)
+* * * * * $(id -un) /usr/local/bin/kitchen-burn >> $ROOT/kitchen/logs/burn.log 2>&1
+EOF
+as_root chmod 644 "$BURN_CRON"
+ok "burn watcher scheduled: $BURN_CRON (every minute)"
 
 # ------------------------------------------------------------------ deploy key
 
@@ -398,6 +424,23 @@ if [ ! -f "$DEPLOY_KEY" ]; then
   ok "new ed25519 keypair generated: $DEPLOY_KEY"
 else
   ok "keypair already exists: $DEPLOY_KEY"
+fi
+
+# Pre-register GitHub's official host keys (from docs.github.com, "GitHub's
+# SSH key fingerprints") so neither you nor cook's first clone gets an
+# interactive "authenticity of host" prompt.
+KNOWN_HOSTS="$HOME/.ssh/known_hosts"
+touch "$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
+if ! grep -q "^github.com ssh-ed25519" "$KNOWN_HOSTS"; then
+  cat >> "$KNOWN_HOSTS" <<'EOF'
+github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+EOF
+  ok "GitHub host keys added to ~/.ssh/known_hosts"
+else
+  ok "GitHub host keys already in ~/.ssh/known_hosts"
 fi
 
 SSH_CONFIG="$HOME/.ssh/config"

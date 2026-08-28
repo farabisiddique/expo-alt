@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# expo-alt :: burn - self-destruct a build after its link has been used.
+#
+# When someone first downloads an APK, that moment is captured (from the
+# nginx access log). DOWNLOAD_TTL_MINUTES later, everything about that build
+# is deleted: the served APK directory, the cloned repo working copy, that
+# build's log file, and the tracking metadata. The next build of the same
+# repo simply re-clones.
+#
+# Runs from cron every minute (installed by setup-kitchen.sh as
+# /etc/cron.d/expo-alt-burn, symlinked as /usr/local/bin/kitchen-burn).
+# Prints nothing unless it acts, so its log stays quiet.
+#
+# Config (in <expo-alt>/.env):
+#   BURN_AFTER_DOWNLOAD=1       set 0 to disable the whole mechanism
+#   DOWNLOAD_TTL_MINUTES=30     grace period after the first download
+#   NGINX_ACCESS_LOGS="..."     space-separated log paths to scan
+#                               (default: /var/log/nginx/access.log{,.1})
+#
+# Safety: a repo whose build is currently running (cook holds its flock) has
+# its working-copy deletion postponed to the next minute, never skipped.
+#
+set -euo pipefail
+
+die() { printf 'burn: ERROR: %s\n' "$*" >&2; exit 1; }
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+[ -f "$ROOT/vps/burn" ] || die "cannot locate the expo-alt dir from $SELF"
+
+# flock helper (flock always exists on the Ubuntu VPS; degrade gracefully
+# where it doesn't, e.g. when testing on Git Bash).
+try_lock() { command -v flock >/dev/null 2>&1 || return 0; flock -n "$1"; }
+
+# Only one burn instance at a time.
+mkdir -p "$ROOT/kitchen/locks"
+exec 8>>"$ROOT/kitchen/locks/.burn.lock"
+try_lock 8 || exit 0
+
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.env"
+  set +a
+fi
+BURN_AFTER_DOWNLOAD="${BURN_AFTER_DOWNLOAD:-1}"
+[ "$BURN_AFTER_DOWNLOAD" != "0" ] || exit 0
+TTL_MIN="${DOWNLOAD_TTL_MINUTES:-30}"
+NGINX_ACCESS_LOGS="${NGINX_ACCESS_LOGS:-/var/log/nginx/access.log /var/log/nginx/access.log.1}"
+
+BUILDS_DIR="$ROOT/builds"
+BURN_DIR="$ROOT/kitchen/burn"
+LOCK_DIR="$ROOT/kitchen/locks"
+mkdir -p "$BURN_DIR"
+shopt -s nullglob
+NOW="$(date +%s)"
+
+# ------------------------------------------------------- 1. stamp first downloads
+# nginx combined log line:
+#   IP - - [28/Aug/2026:14:03:11 +0000] "GET /builds/<id>/<file> HTTP/1.1" 200 ...
+# Emit "dd Mon yyyy HH:MM:SS tz <id>" per successful (200/206) GET.
+
+# shellcheck disable=SC2086
+while IFS= read -r line; do
+  id="${line##* }"
+  ts="${line% *}"
+  stamp="$BURN_DIR/$id.stamp"
+  [ ! -f "$stamp" ] || continue
+  # Only track ids that are (or were) real builds of ours.
+  { [ -d "$BUILDS_DIR/$id" ] || [ -f "$BURN_DIR/$id.meta" ]; } || continue
+  epoch="$(date -d "$ts" +%s 2>/dev/null || true)"
+  [ -n "$epoch" ] || epoch="$NOW"
+  echo "$epoch" > "$stamp"
+  printf 'burn: first download of build %s at %s - self-destruct in %s min\n' \
+    "$id" "$(date -u -d "@$epoch" '+%Y-%m-%d %H:%M:%S') UTC" "$TTL_MIN"
+done < <(
+  grep -h 'GET /builds/' $NGINX_ACCESS_LOGS 2>/dev/null \
+    | awk '($9 == 200 || $9 == 206) {
+        t = $4;  sub(/^\[/, "", t)
+        tz = $5; sub(/\]$/, "", tz)
+        n = split(t, a, /[\/:]/)
+        if (n != 6) next
+        p = $7; sub(/^\/builds\//, "", p); sub(/\/.*$/, "", p)
+        if (p ~ /^[0-9a-f]+$/)
+          print a[1] " " a[2] " " a[3] " " a[4] ":" a[5] ":" a[6] " " tz " " p
+      }'
+)
+
+# ------------------------------------------------------- 2. reap expired builds
+
+for stamp in "$BURN_DIR"/*.stamp; do
+  id="$(basename "$stamp" .stamp)"
+  first="$(cat "$stamp" 2>/dev/null || echo "$NOW")"
+  [ $(( NOW - first )) -ge $(( TTL_MIN * 60 )) ] || continue
+
+  meta="$BURN_DIR/$id.meta"
+  slug=""
+  build_log=""
+  if [ -f "$meta" ]; then
+    slug="$(grep '^slug=' "$meta" | head -1 | cut -d= -f2-)"
+    build_log="$(grep '^log=' "$meta" | head -1 | cut -d= -f2-)"
+  fi
+  # Never let metadata walk us outside our own directories.
+  case "$slug" in */*|*..*|.*) slug="" ;; esac
+  case "$build_log" in "$ROOT/kitchen/logs/"*.log) ;; *) build_log="" ;; esac
+
+  printf 'burn: build %s expired (downloaded %s min ago) - deleting\n' \
+    "$id" $(( (NOW - first) / 60 ))
+  rm -rf "${BUILDS_DIR:?}/$id"
+
+  complete=1
+  if [ -n "$slug" ] && [ -d "$ROOT/kitchen/repos/$slug" ]; then
+    # Take the same per-repo lock cook uses; postpone if a build is running.
+    if (
+      exec 9>>"$LOCK_DIR/$slug.lock"
+      try_lock 9 || exit 3
+      rm -rf "$ROOT/kitchen/repos/$slug"
+    ); then
+      rm -f "$LOCK_DIR/$slug.lock"
+      printf 'burn:   repo working copy %s deleted\n' "$slug"
+    else
+      complete=0
+      printf 'burn:   repo %s busy (build running) - will retry next minute\n' "$slug"
+    fi
+  fi
+
+  if [ -n "$build_log" ]; then
+    rm -f "$build_log"
+  fi
+
+  if [ "$complete" -eq 1 ]; then
+    rm -f "$meta" "$stamp"
+    printf 'burn:   build %s fully burned\n' "$id"
+  fi
+done
+
+# ------------------------------------------------------- 3. sweep orphans
+# A build pruned by retention before anyone downloaded it leaves a .meta with
+# no stamp and no builds dir - nothing left to track.
+
+for meta in "$BURN_DIR"/*.meta; do
+  id="$(basename "$meta" .meta)"
+  if [ ! -d "$BUILDS_DIR/$id" ] && [ ! -f "$BURN_DIR/$id.stamp" ]; then
+    rm -f "$meta"
+  fi
+done
