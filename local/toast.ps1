@@ -33,7 +33,9 @@
 #
 #   toast [repo-name] [profile] [ref] [-NoCheck]
 #       toast                          # inside your app's folder: repo is
-#                                      # auto-detected from `git remote origin`
+#                                      # auto-detected from `git remote origin`,
+#                                      # and the CURRENT BRANCH is built (warns
+#                                      # if you have unpushed commits)
 #       toast myapp                    # explicit repo, profile "preview"
 #       toast myapp production         # profile "production"
 #       toast myapp preview develop    # build the "develop" branch
@@ -125,6 +127,26 @@ function toast {
             return
         }
         Write-Host ("toast: repo detected from this folder's git remote: {0}" -f $Repo) -ForegroundColor Cyan
+
+        # Same folder => also build the branch you're standing on (unless -Ref
+        # was given). Skipped for a detached HEAD, where cook's default applies.
+        if ($Ref -eq "") {
+            $branch = ""
+            try { $branch = (git rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1) } catch {}
+            $branch = "$branch".Trim()
+            if ($branch -ne "" -and $branch -ne "HEAD") {
+                $Ref = $branch
+                Write-Host ("toast: branch detected: {0}" -f $Ref) -ForegroundColor Cyan
+            }
+        }
+
+        # The VPS builds what is on GitHub, not what is on this disk.
+        $ahead = ""
+        try { $ahead = (git rev-list --count "@{u}..HEAD" 2>$null | Select-Object -First 1) } catch {}
+        $ahead = "$ahead".Trim()
+        if ($ahead -match '^\d+$' -and [int]$ahead -gt 0) {
+            Write-Host ("toast: WARNING: {0} unpushed commit(s) on this branch - the VPS builds what is on GitHub. Use toast-push, or git push first." -f $ahead) -ForegroundColor Yellow
+        }
     }
 
     $target = Get-ToastSshTarget

@@ -167,8 +167,8 @@ BUILD_URL_BASE="http://<VPS_IP_OR_DOMAIN>"   # no trailing slash, no path
 ### 6. First build
 
 ```powershell
-toast                        # inside your app's folder: repo auto-detected
-                             # from its git remote; profile "preview", ref "main"
+toast                        # inside your app's folder: repo AND current branch
+                             # auto-detected from git; profile "preview"
 toast-push                   # git push this folder, then build it
 toast myapp                  # explicit repo name (any folder)
 toast myapp production       # different profile
