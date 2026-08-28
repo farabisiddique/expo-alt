@@ -306,7 +306,7 @@ printf '  BUILD OK   %s %s  (profile: %s, %s)\n' "$APP_NAME" "$APP_VERSION" "$PR
 printf '  duration : %s\n' "$(elapsed)"
 printf '  apk size : %s\n' "$APK_SIZE"
 if [ "${BURN_AFTER_DOWNLOAD:-1}" != "0" ]; then
-  printf '  burn     : link self-destructs %s min after its first download\n' \
+  printf '  burn     : link self-destructs %s min after its first complete download\n' \
     "${DOWNLOAD_TTL_MINUTES:-30}"
 fi
 printf '==========================================================\n'

@@ -225,15 +225,17 @@ kitchen-clean               # full clean now
 
 ## Burn after download
 
-Every build **self-destructs 30 minutes after its link is first used**.
-A cron job ([vps/burn](vps/burn), installed as `kitchen-burn`, every minute)
-scans the nginx access log for the first successful download of each
-`/builds/<id>/` link, records that timestamp, and once it is
-`DOWNLOAD_TTL_MINUTES` (default 30) old deletes *everything about that
-build*: the served APK directory, the cloned repo working copy, and that
-build's log file. The next build of the same repo simply re-clones.
+Every build **self-destructs 30 minutes after it is first fully
+downloaded**. A cron job ([vps/burn](vps/burn), installed as `kitchen-burn`,
+every minute) sums the bytes nginx has served for each `/builds/<id>/` link
+(across plain and range requests); when they reach the APK's size the
+download counts as complete, that timestamp is recorded, and once it is
+`DOWNLOAD_TTL_MINUTES` (default 30) old the job deletes *everything about
+that build*: the served APK directory, the cloned repo working copy, and
+that build's log file. The next build of the same repo simply re-clones.
 
-- The link works normally during the 30-minute window (re-downloads
+- A slow or paused download never starts the timer early — only a complete
+  one does. The link keeps working during the 30-minute window (re-downloads
   included); after the burn it 404s — rebuild to get a fresh link.
 - A build that is *never* downloaded is untouched by burn; normal retention
   (14 days / 20 newest) removes it eventually.

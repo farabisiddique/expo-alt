@@ -2,11 +2,13 @@
 #
 # expo-alt :: burn - self-destruct a build after its link has been used.
 #
-# When someone first downloads an APK, that moment is captured (from the
-# nginx access log). DOWNLOAD_TTL_MINUTES later, everything about that build
-# is deleted: the served APK directory, the cloned repo working copy, that
-# build's log file, and the tracking metadata. The next build of the same
-# repo simply re-clones.
+# When an APK has been fully downloaded once (bytes served for that build,
+# summed over all 200/206 responses in the nginx access log, reach the APK
+# size), that moment is captured. DOWNLOAD_TTL_MINUTES later, everything
+# about that build is deleted: the served APK directory, the cloned repo
+# working copy, that build's log file, and the tracking metadata. The next
+# build of the same repo simply re-clones. A slow or paused download never
+# starts the timer early.
 #
 # Runs from cron every minute (installed by setup-kitchen.sh as
 # /etc/cron.d/expo-alt-burn, symlinked as /usr/local/bin/kitchen-burn).
@@ -56,34 +58,44 @@ mkdir -p "$BURN_DIR"
 shopt -s nullglob
 NOW="$(date +%s)"
 
-# ------------------------------------------------------- 1. stamp first downloads
+# ------------------------------------------------------- 1. stamp completed downloads
 # nginx combined log line:
-#   IP - - [28/Aug/2026:14:03:11 +0000] "GET /builds/<id>/<file> HTTP/1.1" 200 ...
-# Emit "dd Mon yyyy HH:MM:SS tz <id>" per successful (200/206) GET.
+#   IP - - [28/Aug/2026:14:03:11 +0000] "GET /builds/<id>/<file> HTTP/1.1" 200 81234567 ...
+# The timer must not start on the first *hit* - a slow phone or a download
+# manager fetching ranges (206) can take hours, and burning mid-download
+# breaks it. Instead, bytes served per build are summed across all 200/206
+# responses; the download counts as complete once they reach the APK size.
+# Emit "dd Mon yyyy HH:MM:SS tz <bytes> <id>" per line, in log order.
 
+declare -A SERVED=()
 # shellcheck disable=SC2086
 while IFS= read -r line; do
   id="${line##* }"
-  ts="${line% *}"
+  rest="${line% *}"
+  bytes="${rest##* }"
+  ts="${rest% *}"
   stamp="$BURN_DIR/$id.stamp"
   [ ! -f "$stamp" ] || continue
-  # Only track ids that are (or were) real builds of ours.
-  { [ -d "$BUILDS_DIR/$id" ] || [ -f "$BURN_DIR/$id.meta" ]; } || continue
+  [ -d "$BUILDS_DIR/$id" ] || continue
+  apk_size="$(stat -c %s "$BUILDS_DIR/$id"/*.apk 2>/dev/null | head -1 || true)"
+  [ -n "$apk_size" ] && [ "$apk_size" -gt 0 ] || continue
+  SERVED[$id]=$(( ${SERVED[$id]:-0} + bytes ))
+  [ "${SERVED[$id]}" -ge "$apk_size" ] || continue
   epoch="$(date -d "$ts" +%s 2>/dev/null || true)"
   [ -n "$epoch" ] || epoch="$NOW"
   echo "$epoch" > "$stamp"
-  printf 'burn: first download of build %s at %s - self-destruct in %s min\n' \
+  printf 'burn: build %s fully downloaded by %s - self-destruct in %s min\n' \
     "$id" "$(date -u -d "@$epoch" '+%Y-%m-%d %H:%M:%S') UTC" "$TTL_MIN"
 done < <(
   grep -h 'GET /builds/' $NGINX_ACCESS_LOGS 2>/dev/null \
-    | awk '($9 == 200 || $9 == 206) {
+    | awk '($9 == 200 || $9 == 206) && $10 ~ /^[0-9]+$/ {
         t = $4;  sub(/^\[/, "", t)
         tz = $5; sub(/\]$/, "", tz)
         n = split(t, a, /[\/:]/)
         if (n != 6) next
         p = $7; sub(/^\/builds\//, "", p); sub(/\/.*$/, "", p)
         if (p ~ /^[0-9a-f]+$/)
-          print a[1] " " a[2] " " a[3] " " a[4] ":" a[5] ":" a[6] " " tz " " p
+          print a[1] " " a[2] " " a[3] " " a[4] ":" a[5] ":" a[6] " " tz " " $10 " " p
       }'
 )
 
