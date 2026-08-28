@@ -220,7 +220,13 @@ case "$PM" in
     pnpm install --frozen-lockfile
     ;;
   npm)
-    npm ci --no-audit --no-fund
+    if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+      npm ci --no-audit --no-fund
+    else
+      echo "    NOTE: no package-lock.json in this repo - falling back to 'npm install'"
+      echo "          (not reproducible; commit a lockfile to the repo to fix this)"
+      npm install --no-audit --no-fund
+    fi
     ;;
 esac
 
